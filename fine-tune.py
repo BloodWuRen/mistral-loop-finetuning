@@ -26,8 +26,10 @@ if accelerator.is_main_process:
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(model_name,
-    torch_dtype=torch.bfloat16)
-model.gradient_checkpointing_disable()
+    torch_dtype=torch.bfloat16,
+    attn_implementation="eager",
+    use_cache = False)
+model.gradient_ch1eckpointing_disable()
 
 tokenizer.pad_token_id = 0
 tokenizer.pad_token = "[pad]"
@@ -95,9 +97,9 @@ def forward(model, batch):
     attention_mask = torch.stack(batch['attention_mask'], dim=1).to(device)
     labels = torch.stack(batch['labels'], dim=1).to(device)
 
-    print(f"input_ids.shape: {input_ids.shape}")
-    print(f"attention_mask.shape: {attention_mask.shape}")
-    print(f"labels.shape: {labels.shape}")
+    # print(f"input_ids.shape: {input_ids.shape}")
+    # print(f"attention_mask.shape: {attention_mask.shape}")
+    # print(f"labels.shape: {labels.shape}")
 
     outputs = model(
         input_ids, 
@@ -105,7 +107,7 @@ def forward(model, batch):
         labels=labels,
     )
 
-    print(f"logits.shape: {outputs.logits.shape}")
+    # print(f"logits.shape: {outputs.logits.shape}")
 
     return outputs
 
