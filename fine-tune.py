@@ -9,6 +9,11 @@ from tqdm import tqdm
 from src.utils import get_logger, get_timestamp
 from src.config import parse_args
 
+import os
+
+os.environ['NCCL_SOCKET_TIMEOUT'] = '7200'
+os.environ['TORCH_DISTRIBUTED_DEFAULT_TIMEOUT'] = '7200'
+
 args = parse_args()
 accelerator = Accelerator()
 args.local_rank = accelerator.process_index
@@ -27,9 +32,8 @@ if accelerator.is_main_process:
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(model_name,
     torch_dtype=torch.bfloat16,
-    attn_implementation="eager",
     use_cache = False)
-model.gradient_ch1eckpointing_disable()
+model.gradient_checkpointing_enable()
 
 tokenizer.pad_token_id = 0
 tokenizer.pad_token = "[pad]"
@@ -64,10 +68,10 @@ def tokenize_function(examples):
         "labels": labels
     }
 
-dataset['train'] = dataset['train'].select(range(10))
+dataset['train'] = dataset['train'].select(range(2000))
 split_dataset = dataset['train'].train_test_split(test_size=0.1, seed=args.seed, shuffle=True)
 
-tokenized_datasets = split_dataset.map(tokenize_function, batched=True, remove_columns=['question', 'answer'])
+tokenized_datasets = split_dataset.map(tokenize_function, batched=True, remove_columns=['question', 'answer'], load_from_cache_file=True, keep_in_memory=False)
 
 train_dataset = tokenized_datasets['train']
 eval_dataset = tokenized_datasets['test']
@@ -101,13 +105,27 @@ def forward(model, batch):
     # print(f"attention_mask.shape: {attention_mask.shape}")
     # print(f"labels.shape: {labels.shape}")
 
-    outputs = model(
+    hidden_states = model(
         input_ids, 
-        attention_mask=attention_mask,
-        labels=labels,
-    )
+        attention_mask=attention_mask, 
+        output_hidden_states=True,
+        # labels=labels,
+    ).hidden_states[-1]
 
-    # print(f"logits.shape: {outputs.logits.shape}")
+
+    for t in range(args.num_loops - 1):
+        if t < args.num_loops - 2:
+            hidden_states = model(
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            ).hidden_states[-1]
+        else:
+            outputs = model(
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
 
     return outputs
 
@@ -132,13 +150,6 @@ for epoch in range(args.num_epochs):
         if args.local_rank == 0 and global_steps % args.logging_steps == 0:
             logger.info(f"Step {global_steps}: Loss = {loss.item()}")
     
-    if (epoch + 1) % args.save_steps == 0 and accelerator.is_main_process:
-        unwrapped_model = accelerator.unwrap_model(model)
-
-        logger.info(f"Saving model checkpoint...")
-        torch.save(unwrapped_model.state_dict(), output_dir / f"checkpoint-{epoch + 1}.pt")
-        logger.info(f"Model checkpoint saved to {output_dir / f'checkpoint-{epoch + 1}.pt'}")
-    
     if (epoch + 1) % args.eval_steps == 0:
         if accelerator.is_main_process:
             logger.info(f"Evaluating model...")
@@ -156,3 +167,20 @@ for epoch in range(args.num_epochs):
 
         if accelerator.is_main_process:
             logger.info(f"Test average perplexity: {loss}")
+
+accelerator.wait_for_everyone()  # 确保所有进程完成训练
+
+if accelerator.is_main_process:
+    logger.info("Saving model checkpoint...")
+    
+    # 使用加速器的内置保存方法（推荐）
+    accelerator.save_model(
+        model=accelerator.unwrap_model(model),
+        save_directory=output_dir,
+        max_shard_size="10GB"  # 自动分片保存，避免内存不足
+    )
+    
+    # 保存tokenizer
+    tokenizer.save_pretrained(output_dir)
+    
+    logger.info(f"Model checkpoint saved to {output_dir}")
