@@ -8,7 +8,7 @@ def parse_args():
     parser.add_argument('--model_name', type=str, default='/data/zhangzhi/mistralai/Mistral-7B-Instruct-v0.3', help='Model name or path.')
     parser.add_argument('--dataset_name', type=str, default='/data/zhangzhi/dataset/openai/gsm8k', help='Dataset name or path.')
     parser.add_argument('--output_dir', type=str, default='output', help='Output directory for model and logs.')
-    parser.add_argument('--num_epochs', type=int, default=3, help='Number of training epochs.')
+    parser.add_argument('--num_epochs', type=int, default=1, help='Number of training epochs.')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training.')
     parser.add_argument('--num_loops', type=int, default=2, help='Number of loops.')
     parser.add_argument('--learning_rate', type=float, default=5e-6, help='Learning rate for the optimizer.')

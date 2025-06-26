@@ -45,8 +45,8 @@ if accelerator.is_main_process:
 dataset = load_dataset(args.dataset_name, "main")
 
 def tokenize_function(examples):
-    texts = [f"Question: {x}\nAnswer:{y}" for (x, y) in zip(examples['question'], examples['answer'])]
-
+    # no cot
+    texts = [f"Question: {x}\nAnswer: {y.strip().split("####")[-1].strip()}" for (x, y) in zip(examples['question'], examples['answer'])]
     tokenized = tokenizer(
         texts, 
         padding="max_length",
@@ -68,7 +68,7 @@ def tokenize_function(examples):
         "labels": labels
     }
 
-dataset['train'] = dataset['train'].select(range(2000))
+dataset['train'] = dataset['train'].select(range(10))
 split_dataset = dataset['train'].train_test_split(test_size=0.1, seed=args.seed, shuffle=True)
 
 tokenized_datasets = split_dataset.map(tokenize_function, batched=True, remove_columns=['question', 'answer'], load_from_cache_file=True, keep_in_memory=False)
@@ -168,19 +168,11 @@ for epoch in range(args.num_epochs):
         if accelerator.is_main_process:
             logger.info(f"Test average perplexity: {loss}")
 
-accelerator.wait_for_everyone()  # 确保所有进程完成训练
-
+accelerator.wait_for_everyone()
 if accelerator.is_main_process:
-    logger.info("Saving model checkpoint...")
-    
-    # 使用加速器的内置保存方法（推荐）
-    accelerator.save_model(
-        model=accelerator.unwrap_model(model),
-        save_directory=output_dir,
-        max_shard_size="10GB"  # 自动分片保存，避免内存不足
-    )
-    
-    # 保存tokenizer
+    unwrapped_model = accelerator.unwrap_model(model)
+
+    logger.info(f"Saving model checkpoint...")
+    accelerator.save_model(model, output_dir)
     tokenizer.save_pretrained(output_dir)
-    
-    logger.info(f"Model checkpoint saved to {output_dir}")
+    logger.info(f"Model checkpoint saved to {output_dir / f'checkpoint-{epoch + 1}.pt'}")
