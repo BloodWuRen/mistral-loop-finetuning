@@ -1,0 +1,21 @@
+[2025-06-26 11:54:55,494] [__main__] [INFO] Finetuning args: {
+    "config": null,
+    "max_data_length": 512,
+    "model_name": "/data/zhangzhi/mistralai/Mistral-7B-Instruct-v0.3",
+    "dataset_name": "/data/zhangzhi/dataset/openai/gsm8k",
+    "output_dir": "output",
+    "num_epochs": 3,
+    "batch_size": 1,
+    "num_loops": 3,
+    "learning_rate": 5e-06,
+    "logging_steps": 100,
+    "save_steps": 3,
+    "eval_steps": 1,
+    "seed": 42,
+    "warmup_ratio": 0.1,
+    "local_rank": 0
+}
+[2025-06-26 11:54:55,494] [__main__] [INFO] Loading model /data/zhangzhi/mistralai/Mistral-7B-Instruct-v0.3...
+[2025-06-26 11:54:56,704] [__main__] [INFO] Loading dataset /data/zhangzhi/dataset/openai/gsm8k...
+[2025-06-26 11:54:56,853] [__main__] [INFO] Train dataset size: 90
+[2025-06-26 11:54:56,853] [__main__] [INFO] Eval dataset size: 10
