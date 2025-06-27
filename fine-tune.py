@@ -46,7 +46,7 @@ dataset = load_dataset(args.dataset_name, "main")
 
 def tokenize_function(examples):
     # no cot
-    texts = [f"Question: {x}\nAnswer: {y.strip().split("####")[-1].strip()}" for (x, y) in zip(examples['question'], examples['answer'])]
+    texts = [f"Only output the final result as just a single number without unit or explanation.\nQuestion: {x}\nAnswer: {y.strip().split("####")[-1].strip()}" for (x, y) in zip(examples['question'], examples['answer'])]
     tokenized = tokenizer(
         texts, 
         padding="max_length",
@@ -55,7 +55,7 @@ def tokenize_function(examples):
         max_length=args.max_data_length,
     )
 
-    input_lens = [len(tokenizer(f"Question: {x}\nAnswer:").input_ids) for x in examples['question']]
+    input_lens = [len(tokenizer(f"Only output the final result as just a single number without unit or explanation.\nQuestion: {x}\nAnswer: ").input_ids) for x in examples['question']]
 
     labels = tokenized.input_ids.clone()
     labels[labels == tokenizer.pad_token_id] = -100
@@ -96,38 +96,32 @@ output_dir.mkdir(parents=True, exist_ok=True)
 
 global_steps = 0
 
+alpha = 0.01
+
 def forward(model, batch):
     input_ids = torch.stack(batch['input_ids'], dim=1).to(device)
     attention_mask = torch.stack(batch['attention_mask'], dim=1).to(device)
     labels = torch.stack(batch['labels'], dim=1).to(device)
 
-    # print(f"input_ids.shape: {input_ids.shape}")
-    # print(f"attention_mask.shape: {attention_mask.shape}")
-    # print(f"labels.shape: {labels.shape}")
-
     hidden_states = model(
         input_ids, 
         attention_mask=attention_mask, 
         output_hidden_states=True,
-        # labels=labels,
     ).hidden_states[-1]
 
+    original_hidden_states = hidden_states
 
     for t in range(args.num_loops - 1):
-        if t < args.num_loops - 2:
-            hidden_states = model(
-                inputs_embeds=hidden_states,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            ).hidden_states[-1]
-        else:
-            outputs = model(
-                inputs_embeds=hidden_states,
-                attention_mask=attention_mask,
-                labels=labels,
-            )
-
-    return outputs
+        hidden_states = model(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        ).hidden_states[-1]
+    logits = model.lm_head(original_hidden_states + alpha * hidden_states)
+    # print(f"logits shape: {logits.shape}")
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+    return loss
 
 for epoch in range(args.num_epochs):
     model.train()
@@ -140,8 +134,7 @@ for epoch in range(args.num_epochs):
     for batch in pbar:
         global_steps += 1
         optimizer.zero_grad()
-        outputs = forward(model, batch)
-        loss = outputs.loss
+        loss = forward(model, batch)
         accelerator.backward(loss)
         accelerator.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -159,8 +152,8 @@ for epoch in range(args.num_epochs):
         losses = []
         for batch in tqdm(eval_dataloader, desc="Evaluating", disable=not accelerator.is_main_process):
             with torch.no_grad():
-                outputs = forward(model, batch)
-                losses.append(outputs.loss.item())
+                loss = forward(model, batch)
+                losses.append(loss.item())
         
         loss = torch.tensor(sum(losses) / len(losses), device=device)
         loss = accelerator.gather(loss).mean().item()
@@ -168,11 +161,23 @@ for epoch in range(args.num_epochs):
         if accelerator.is_main_process:
             logger.info(f"Test average perplexity: {loss}")
 
-accelerator.wait_for_everyone()
 if accelerator.is_main_process:
-    unwrapped_model = accelerator.unwrap_model(model)
-
     logger.info(f"Saving model checkpoint...")
-    accelerator.save_model(model, output_dir)
+
+accelerator.wait_for_everyone()
+unwrapped_model = accelerator.unwrap_model(model)
+state_dict = accelerator.get_state_dict(model)
+unwrapped_model.save_pretrained(
+    output_dir,
+    is_main_process=accelerator.is_main_process,
+    save_function=accelerator.save,
+    state_dict=state_dict,
+)
+if accelerator.is_main_process:
     tokenizer.save_pretrained(output_dir)
-    logger.info(f"Model checkpoint saved to {output_dir / f'checkpoint-{epoch + 1}.pt'}")
+    # unwrapped_model = accelerator.unwrap_model(model)
+    # model.save_16bit_model(output_dir)
+    # tokenizer.save_pretrained(output_dir)
+    # # torch.save(unwrapped_model.state_dict(), output_dir / f"checkpoint-{epoch + 1}.pt")
+    # logger.info(f"Model checkpoint saved to {output_dir / f'checkpoint-{epoch + 1}.pt'}")
+accelerator.end_training()
