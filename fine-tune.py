@@ -161,23 +161,48 @@ for epoch in range(args.num_epochs):
         if accelerator.is_main_process:
             logger.info(f"Test average perplexity: {loss}")
 
-if accelerator.is_main_process:
-    logger.info(f"Saving model checkpoint...")
+def save_model_checkpoint(accelerator, model, tokenizer, output_dir):
+    accelerator.print("🔄 Waiting for all processes to sync before saving...")
+    accelerator.wait_for_everyone()
 
-accelerator.wait_for_everyone()
-unwrapped_model = accelerator.unwrap_model(model)
-state_dict = accelerator.get_state_dict(model)
-unwrapped_model.save_pretrained(
-    output_dir,
-    is_main_process=accelerator.is_main_process,
-    save_function=accelerator.save,
-    state_dict=state_dict,
+    accelerator.print("📦 Gathering full state_dict for ZeRO-3 (if enabled)...")
+    try:
+        state_dict = accelerator.get_state_dict(model)
+    except Exception as e:
+        accelerator.print(f"❌ Failed to gather state_dict: {e}")
+        return
+
+    accelerator.print("💾 Saving model and tokenizer...")
+    try:
+        # unwrap_model 是必须的，否则 save_pretrained 可能不识别
+        unwrapped_model = accelerator.unwrap_model(model)
+        
+        unwrapped_model.save_pretrained(
+            output_dir,
+            is_main_process=accelerator.is_main_process,
+            save_function=accelerator.save,
+            state_dict=state_dict,
+        )
+
+        if accelerator.is_main_process:
+            tokenizer.save_pretrained(output_dir)
+            accelerator.print(f"✅ Model and tokenizer saved to: {output_dir}")
+
+            # 可选：验证保存是否成功
+            try:
+                from transformers import AutoModelForCausalLM
+                _ = AutoModelForCausalLM.from_pretrained(output_dir)
+                accelerator.print("🧪 Model reloaded successfully from saved directory.")
+            except Exception as load_err:
+                accelerator.print(f"❌ Reloading saved model failed: {load_err}")
+
+    except Exception as save_err:
+        accelerator.print(f"❌ Saving model failed: {save_err}")
+
+save_model_checkpoint(
+    accelerator=accelerator,
+    model=model,
+    tokenizer=tokenizer,
+    output_dir=output_dir
 )
-if accelerator.is_main_process:
-    tokenizer.save_pretrained(output_dir)
-    # unwrapped_model = accelerator.unwrap_model(model)
-    # model.save_16bit_model(output_dir)
-    # tokenizer.save_pretrained(output_dir)
-    # # torch.save(unwrapped_model.state_dict(), output_dir / f"checkpoint-{epoch + 1}.pt")
-    # logger.info(f"Model checkpoint saved to {output_dir / f'checkpoint-{epoch + 1}.pt'}")
 accelerator.end_training()
