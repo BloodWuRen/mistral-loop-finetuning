@@ -1,5 +1,7 @@
 import json
 import torch
+import re
+from matplotlib import pyplot as plt
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from accelerate import Accelerator
@@ -42,11 +44,19 @@ model.config.pad_token_id = tokenizer.pad_token_id
 if accelerator.is_main_process:
     logger.info(f"Loading dataset {args.dataset_name}...")
 
-dataset = load_dataset(args.dataset_name, "main")
+dataset = load_dataset(args.dataset_name, "default")
+
+def extract_last_number(text):
+    numbers = re.findall(r'-?\d+(?:\.\d+)?', text)
+    if numbers:
+        return numbers[-1]
+    else:
+        return None
 
 def tokenize_function(examples):
     # no cot
-    texts = [f"Only output the final result as just a single number without unit or explanation.\nQuestion: {x}\nAnswer: {y.strip().split("####")[-1].strip()}" for (x, y) in zip(examples['question'], examples['answer'])]
+    texts = [f"Only output the final result as just a single number without unit or explanation.\nQuestion: {x[0]["content"]}\nAnswer: {extract_last_number(x[1]["content"]).strip()}" for x in examples['messages']]
+
     tokenized = tokenizer(
         texts, 
         padding="max_length",
@@ -55,7 +65,7 @@ def tokenize_function(examples):
         max_length=args.max_data_length,
     )
 
-    input_lens = [len(tokenizer(f"Only output the final result as just a single number without unit or explanation.\nQuestion: {x}\nAnswer: ").input_ids) for x in examples['question']]
+    input_lens = [len(tokenizer(f"Only output the final result as just a single number without unit or explanation.\nQuestion: {x[0]["content"]}\nAnswer: ").input_ids) for x in examples['messages']]
 
     labels = tokenized.input_ids.clone()
     labels[labels == tokenizer.pad_token_id] = -100
@@ -68,10 +78,11 @@ def tokenize_function(examples):
         "labels": labels
     }
 
-dataset['train'] = dataset['train'].select(range(10))
-split_dataset = dataset['train'].train_test_split(test_size=0.1, seed=args.seed, shuffle=True)
+dataset['train_119K'] = dataset['train_119K'].select(range(100))
+del dataset['train']
+split_dataset = dataset['train_119K'].train_test_split(test_size=0.1, seed=args.seed, shuffle=True)
 
-tokenized_datasets = split_dataset.map(tokenize_function, batched=True, remove_columns=['question', 'answer'], load_from_cache_file=True, keep_in_memory=False)
+tokenized_datasets = split_dataset.map(tokenize_function, batched=True, remove_columns=['id', 'messages'], load_from_cache_file=False, keep_in_memory=True)
 
 train_dataset = tokenized_datasets['train']
 eval_dataset = tokenized_datasets['test']
@@ -117,12 +128,78 @@ def forward(model, batch):
             attention_mask=attention_mask,
             output_hidden_states=True,
         ).hidden_states[-1]
-    logits = model.lm_head(original_hidden_states + alpha * hidden_states)
+    if args.num_loops > 1:
+        logits = model.lm_head(original_hidden_states + alpha * hidden_states)
+    else:
+        logits = model.lm_head(original_hidden_states)
     # print(f"logits shape: {logits.shape}")
     loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-    loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
     return loss
 
+def format_prompt(question: str) -> str:
+    return (
+        "Only output the final result as just a single number without unit or explanation.\n"
+        f"Question: {question}\nAnswer: "
+    )
+
+dataset['train_119K'].select(range(100))
+
+def eval_acc(model, tokenizer, accelerator):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for example in tqdm(dataset['train_119K'], desc="Evaluating ACC", disable=not accelerator.is_main_process):
+            example = example["messages"]
+            question = example[0]["content"]
+            gold_answer = extract_last_number(example[1]["content"])
+
+            prompt = format_prompt(question)
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+            generated = input_ids.clone()
+            
+            for _ in range(10):
+                attention_mask = torch.ones_like(generated)
+                
+                outputs = model(generated, attention_mask=attention_mask, output_hidden_states=True)
+                hidden_states = outputs.hidden_states[-1]
+                original_hidden_states = hidden_states
+
+                for _ in range(args.num_loops - 1):
+                    hidden_states = model(inputs_embeds=hidden_states, attention_mask=attention_mask, output_hidden_states=True).hidden_states[-1]
+
+                logits = model.lm_head(original_hidden_states + alpha * hidden_states)
+
+                next_token_logits = logits[:, -1, :]
+
+                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+
+                generated = torch.cat((generated, next_token.T), dim=1)
+
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
+            
+            decoded = tokenizer.decode(generated[0], skip_special_tokens=True)
+            
+            if "####" in decoded:
+                pred_answer = extract_last_number(decoded.split("####")[-1].strip().split("\n")[0])
+            else:
+                pred_answer = extract_last_number(decoded.split("Answer:")[-1].strip().split("\n")[0])
+            if accelerator.is_main_process:
+            #     print(decoded)
+                print(pred_answer, gold_answer)
+            total += 1
+            if pred_answer is not None and abs(float(pred_answer) - float(gold_answer)) < 1e-7:
+                correct += 1
+
+    acc = correct / total if total > 0 else 0.0
+    return acc
+
+history = {'train_loss': [], 'train_acc': [], 'test_loss': [], 'test_acc': []}
 for epoch in range(args.num_epochs):
     model.train()
     pbar = tqdm(
@@ -140,8 +217,10 @@ for epoch in range(args.num_epochs):
         optimizer.step()
         scheduler.step()
 
-        if args.local_rank == 0 and global_steps % args.logging_steps == 0:
-            logger.info(f"Step {global_steps}: Loss = {loss.item()}")
+        if global_steps % args.logging_steps == 0:
+            if accelerator.is_main_process:
+                logger.info(f"Step {global_steps}: Loss = {loss.item()}")
+                history['train_loss'].append(loss.item())
     
     if (epoch + 1) % args.eval_steps == 0:
         if accelerator.is_main_process:
@@ -161,8 +240,22 @@ for epoch in range(args.num_epochs):
         if accelerator.is_main_process:
             logger.info(f"Test average perplexity: {loss}")
 
+    acc = eval_acc(model=model, tokenizer=tokenizer, accelerator=accelerator)
+    if accelerator.is_main_process:
+        logger.info(f"Train average acc: {acc}")
+        history['train_acc'].append(acc)
+
 if accelerator.is_main_process:
     logger.info(f"Saving model checkpoint...")
+
+plt.figure()
+plt.subplot(1, 2, 1)
+plt.plot(history['train_loss'], label='train_loss')
+plt.legend()
+plt.subplot(1, 2, 2)
+plt.plot(history['train_acc'], label='train_acc')
+plt.legend()
+plt.savefig('plot.png')
 
 accelerator.wait_for_everyone()
 unwrapped_model = accelerator.unwrap_model(model)
@@ -175,9 +268,7 @@ unwrapped_model.save_pretrained(
 )
 if accelerator.is_main_process:
     tokenizer.save_pretrained(output_dir)
-    # unwrapped_model = accelerator.unwrap_model(model)
-    # model.save_16bit_model(output_dir)
-    # tokenizer.save_pretrained(output_dir)
-    # # torch.save(unwrapped_model.state_dict(), output_dir / f"checkpoint-{epoch + 1}.pt")
-    # logger.info(f"Model checkpoint saved to {output_dir / f'checkpoint-{epoch + 1}.pt'}")
+
+if accelerator.is_main_process:
+    logger.info(f"Saved model to {output_dir}.")
 accelerator.end_training()
